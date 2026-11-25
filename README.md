@@ -2,6 +2,8 @@
 
 English | [中文](README.zh.md)
 
+> This is a fork of [V1ki/dsh-plugin-subscriptions](https://github.com/V1ki/dsh-plugin-subscriptions) based on `v0.9.15`. The [`self-hosted-usage` branch](https://github.com/bowen-bd/dsh-plugin-subscriptions/tree/self-hosted-usage) adds an [optional DeepSeek usage feed](#optional-self-hosted-deepseek-usage), a scoped activity heatmap, and dashboard-only provider visibility. It is not the upstream npm release.
+
 Use your **ChatGPT (Codex)**, **Claude**, **Grok (X Premium)**, **GitHub Copilot**, and **Google Antigravity** subscriptions as LLM providers in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — no API keys. Codex, Grok, and Antigravity log in via OAuth in the dsh web UI (Settings → Subscriptions), while Copilot uses the GitHub OAuth device flow; Claude imports credentials from an existing Claude Code session when there is one (macOS Keychain or `~/.claude/.credentials.json`) and otherwise falls back to the same browser OAuth flow, so the Claude Code CLI is not required. Tokens live at `~/.dsh/plugins/subscriptions/auth.json` (mode 0600) and refresh automatically.
 
 ## Subscription and model display names
@@ -83,6 +85,45 @@ Open **Subscriptions** from the DSH sidebar to view the unified page with **Usag
 
 The plugin saves aggregate counts, cycle quota percentages, and window metadata locally under `~/.dsh/plugins/subscriptions/usage/` (mode `0600`); it does not store prompts, credentials, or per-request logs there. **Clear history** removes this plugin's local usage history for a selected provider or all providers without affecting DSH sessions, accounts, or live quota. Opening the dashboard makes no extra quota requests and does not estimate cost.
 
+### Optional self-hosted DeepSeek usage
+
+The heatmap follows the selected provider and account; its window stays at 26 UTC weeks regardless of the date range used by the charts. To hide a provider from **Usage** totals, filters, quota charts, and **Clear history**, set `usageHiddenProviders` on `llm-subscriptions` in your profile. This does not disable the provider's Settings, login, or model routing.
+
+The local source is off by default. To enable it, point the plugin at your own **loopback-only** aggregate service. For example, in your profile's patch:
+
+```yaml
+- id: llm-subscriptions
+  config:
+    usageHiddenProviders: [grok]   # optional; omit to show all tracked providers
+    selfHostedUsage:
+      port: 43210                  # required; port of your own feed
+      model: Example DeepSeek      # optional display name
+      accountLabel: Local server   # optional display name
+```
+
+Add these keys to your existing `llm-subscriptions` configuration if you already have an override. A profile patch replaces the entire `config` for that entry, so keep the other settings you need.
+
+The plugin makes a server-side `GET /api/subscriptions-usage` to `http://127.0.0.1:<port>` without following redirects. Your service must return a JSON snapshot like this (use the actual completed scan time, not the response time):
+
+```json
+{
+  "updatedAt": 1795583100000,
+  "days": [
+    {
+      "date": "2026-11-25",
+      "inputTokens": 100,
+      "outputTokens": 25,
+      "cacheReadTokens": 70,
+      "cacheWriteTokens": 5,
+      "reasoningTokens": 10,
+      "cacheUnknownPromptTokens": 40
+    }
+  ]
+}
+```
+
+`updatedAt` is a Unix timestamp in milliseconds. Supply one row per UTC date, with nonnegative integer counts. Input, output, cache reads, and cache writes are disjoint buckets; reasoning is a subset of output, and unknown-cache prompt tokens are a subset of input plus cache reads and writes. Mark partial scans with optional `incomplete: true`. Refresh the snapshot at least every three minutes to avoid the stale-data notice. Return only aggregate counts, not prompts, credentials, or session identifiers. The plugin does not install a log scanner or extract data from sessions by itself. The local source has no quota and is never included in **Clear history**.
+
 ## Providers
 
 | Route    | Subscription      | Models |
@@ -139,16 +180,16 @@ Claude requests present themselves as Claude Code, and the endpoint gates newer 
 
 ### Installation commands
 
-With the `dsh` CLI available, install from npm (prebuilt artifacts, no build permission needed):
+If you only want the original plugin, install the upstream npm package (prebuilt artifacts, no build permission needed):
 
 ```sh
 dsh plugin --profile web add dsh-plugin-subscriptions
 ```
 
-Or install the sources from GitHub:
+To try the fork, install its source branch from GitHub instead. It uses the same package name as upstream, so install one or the other in a profile, not both:
 
 ```sh
-dsh plugin --profile web add github:V1ki/dsh-plugin-subscriptions
+dsh plugin --profile web add github:bowen-bd/dsh-plugin-subscriptions#self-hosted-usage
 ```
 
 pnpm will ask you to allow this package's build script on first install (git installs fetch sources, not built artifacts); add the printed key to the profile's `pnpm-workspace.yaml`:
@@ -163,8 +204,8 @@ and re-run the `add`. Only grant this to packages you trust — it runs the pack
 From a local checkout instead:
 
 ```sh
-git clone https://github.com/V1ki/dsh-plugin-subscriptions.git
-cd dsh-plugin-subscriptions && pnpm install && pnpm build
+git clone --branch self-hosted-usage https://github.com/bowen-bd/dsh-plugin-subscriptions.git
+(cd dsh-plugin-subscriptions && pnpm install --frozen-lockfile && pnpm build)
 dsh plugin --profile web add ./dsh-plugin-subscriptions
 ```
 
@@ -183,7 +224,7 @@ Installed from npm:
 dsh plugin --profile web update --latest dsh-plugin-subscriptions
 ```
 
-Installed from GitHub: re-run the same `add github:V1ki/dsh-plugin-subscriptions` command — it re-fetches the sources and rebuilds. A linked local checkout just needs `git pull && pnpm build` in the checkout.
+Installed from GitHub: re-run the same `add github:bowen-bd/dsh-plugin-subscriptions#self-hosted-usage` command — it re-fetches the sources and rebuilds. A linked local checkout just needs `git pull && pnpm build` in the checkout.
 
 Either way, restart `dsh web` afterwards so the new version loads.
 
@@ -404,15 +445,9 @@ The pnpm package extension supplies the published UI primitives' browser depende
 
 After `pnpm build`, restart `dsh web` to pick up changes.
 
-### Release
+### Fork builds
 
-Releases are published by GitHub Actions ([`release.yml`](.github/workflows/release.yml)), not from a maintainer machine. Bump `version` in `package.json`, commit, then push a matching tag:
-
-```sh
-git tag v0.9.8 && git push origin main v0.9.8
-```
-
-The workflow checks that the tag matches `package.json`, installs with the frozen lockfile, runs `pnpm build` and `pnpm test`, publishes through [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers) with a [provenance attestation](https://docs.npmjs.com/generating-provenance-statements), and creates the GitHub release with generated notes. Prerelease versions (`0.10.0-rc.1`) go to the `next` dist-tag. No npm token is stored in the repository: npm authenticates the workflow via OIDC, and the provenance on the npm package page links each published tarball to the exact commit and workflow run that built it.
+This branch is distributed as GitHub source, not through npm. [Fork CI](.github/workflows/fork-ci.yml) builds and tests the code without publishing a package. For a reproducible install, replace `#self-hosted-usage` in the GitHub install command with a full commit SHA.
 
 ## Layout
 

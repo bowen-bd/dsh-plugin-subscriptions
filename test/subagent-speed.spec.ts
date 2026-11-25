@@ -132,6 +132,7 @@ test('main speed and per-model subagent defaults stay independent through RPC, r
   } finally {
     await host?.runtime.dispose()
     if (previous === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = previous
-    await rm(home, { recursive: true, force: true })
+    // A background usage write can race the first recursive removal after dispose.
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })

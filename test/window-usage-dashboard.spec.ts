@@ -307,6 +307,46 @@ test('range filtering (7d/30d/90d/all), 182-day heatmap, and provider/account fi
   assert.equal(staleAcct.summary.totalTokens, 1700)
 })
 
+test('heatmap scopes All, Codex, DeepSeek and accounts without hidden Grok history', () => {
+  const date = '2026-11-22'
+  const cloud = (provider: 'codex' | 'claude' | 'grok', tokens: number) => ({
+    provider,
+    entries: [makeEntry({
+      id: provider, provider, account: `${provider}-account`, kind: 'weekly', resetsAt: NOW + HOUR_MS,
+      models: { [provider]: counts(tokens) }, days: { [date]: { [provider]: counts(tokens) } },
+    })],
+    loggedIn: [], observed: () => [], preTracking: { state: 'unavailable' as const }, errors: [],
+  })
+  const input = {
+    now: NOW, trackingStartedAt: START, hiddenProviders: ['grok'] as const,
+    providers: [cloud('codex', 600), cloud('claude', 300), cloud('grok', 900)],
+    localUsage: { updatedAt: NOW, days: [{ date, ...counts(250), cacheUnknownPromptTokens: 0 }] },
+  }
+  const visible = { codex: 600, claude: 300, 'deepseek-local': 250 }
+  for (const { query, provider, byProvider } of [
+    { query: {}, provider: 'all', byProvider: visible },
+    { query: { provider: 'codex' }, provider: 'codex', byProvider: { codex: 600 } },
+    { query: { provider: 'deepseek-local' }, provider: 'deepseek-local', byProvider: { 'deepseek-local': 250 } },
+    { query: { account: 'deepseek-local:host' }, provider: 'all', byProvider: { 'deepseek-local': 250 } },
+  ] as const) {
+    const dash = buildUsageDashboard(input, { range: '7d', ...query })
+    const total = Object.values(byProvider).reduce<number>((sum, count) => sum + count, 0)
+    assert.equal(dash.filters.provider, provider)
+    assert.equal(dash.summary.totalTokens, total)
+    assert.equal(dash.heatmap.length, 182)
+    const day = dash.heatmap.find(d => d.date === date)
+    assert.deepEqual(day?.byProvider, byProvider)
+    assert.deepEqual(Object.fromEntries(day?.byModel.map(m => [m.provider, m.totalTokens]) ?? []), byProvider)
+    assert.equal(day?.totalTokens, total)
+    assert.doesNotMatch(JSON.stringify(dash), /"grok"/)
+    assert.equal(Object.hasOwn(dash.clearInfo, 'grok'), false)
+  }
+  const hiddenQuery = buildUsageDashboard(input, { provider: 'grok', account: 'grok-account' })
+  assert.deepEqual(hiddenQuery.filters, { provider: 'all', account: 'all' })
+  assert.equal(hiddenQuery.summary.totalTokens, 1150)
+  assert.equal(buildUsageDashboard({ ...input, hiddenProviders: [] }, {}).summary.totalTokens, 2050)
+})
+
 test('end-to-end UsageService + UsageHistoryController + RPC usageDashboard & clearUsageHistory(all)', async (t: TestContext) => {
   const dir = await mkdtemp(join(tmpdir(), 'usage-dashboard-rpc-'))
   let clock = NOW - DAY_MS
@@ -348,6 +388,14 @@ test('end-to-end UsageService + UsageHistoryController + RPC usageDashboard & cl
     finishedAt: clock + 2000,
     chunk: { type: 'usage', usage: { inputTokens: 400, outputTokens: 100 } },
   })
+  store.observe('grok', 'grok-account', {
+    supported: true,
+    windows: [{ kind: 'weekly', durationMs: 7 * DAY_MS, usedPercent: 5, resetsAt: clock + 7 * DAY_MS }],
+  }, clock)
+  store.recordRequest({
+    provider: 'grok', account: 'grok-account', model: 'grok-fixture', finishedAt: clock + 3000,
+    chunk: { type: 'usage', usage: { inputTokens: 900, outputTokens: 0 } },
+  })
   await store.flush()
 
   clock = NOW
@@ -355,6 +403,8 @@ test('end-to-end UsageService + UsageHistoryController + RPC usageDashboard & cl
     service,
     async provider => provider === 'codex' ? [{ key: 'acct-a', label: 'a@example.com' }] : [],
     () => clock,
+    undefined,
+    ['grok'],
   )
 
   // Wire through real registerAuthRpc + fake connection.
@@ -399,9 +449,13 @@ test('end-to-end UsageService + UsageHistoryController + RPC usageDashboard & cl
   const dash = okDash.value as Awaited<ReturnType<typeof controller.usageDashboard>>
   assert.equal(dash.summary.totalTokens, 1600)
   assert.equal(dash.summary.reasoningTokens, 50)
-  assert.equal(dash.clearInfo.codex.accounts, 1)
-  assert.equal(dash.clearInfo.claude.accounts, 1)
+  assert.equal(dash.clearInfo.codex?.accounts, 1)
+  assert.equal(dash.clearInfo.claude?.accounts, 1)
   assert.equal(dash.cleared, false)
+  assert.ok(!dash.providers.some(p => p.provider === 'grok'))
+  assert.equal(Object.hasOwn(dash.clearInfo, 'grok'), false)
+  const grokBefore = await controller.accountUsage({ provider: 'grok', kind: 'weekly' })
+  assert.equal(grokBefore.view.window?.models['grok-fixture']?.inputTokens, 900)
   // Quota utilization % from store.observe(...) flows into quotaCycles & activeWindows.
   const codexWeeklyCycle = dash.quotaCycles.find(c => c.provider === 'codex' && c.kind === 'weekly')
   assert.ok(codexWeeklyCycle)
@@ -430,6 +484,11 @@ test('end-to-end UsageService + UsageHistoryController + RPC usageDashboard & cl
   // Clear all providers via provider: 'all'.
   const clearAll = await fake.handler('clearUsageHistory', { provider: 'all', confirm: true }, signal)
   assert.equal(clearAll.ok, true)
+  const grokAfter = await controller.accountUsage({ provider: 'grok', kind: 'weekly' })
+  assert.deepEqual(grokAfter.stored, grokBefore.stored)
+  assert.equal(grokAfter.view.window?.models['grok-fixture']?.inputTokens, 900)
+  const hiddenClear = await fake.handler('clearUsageHistory', { provider: 'grok', confirm: true }, signal)
+  assert.equal(hiddenClear.ok, false)
 
   const afterAllClear = await fake.handler('usageDashboard', {}, signal)
   assert.equal(afterAllClear.ok, true)

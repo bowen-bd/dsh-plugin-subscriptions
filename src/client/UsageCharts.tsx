@@ -14,6 +14,7 @@ import {
   formatTokens,
   providerAccentColor,
   providerDisplayName,
+  unknownCacheTokens,
   type Translate,
 } from './usage-format.js'
 
@@ -244,6 +245,11 @@ function DailyTrendChart({
                 <span style={{ color: 'var(--dsh-tok-cache-write)' }}>{t('usageLegendCacheWrite')}</span>
                 <span>{formatTokens(hovered.cacheWriteTokens)}</span>
               </div>
+              {unknownCacheTokens(hovered) > 0 && (
+                <div className="dsh-usage-tooltip-row" style={{ opacity: 0.8 }}>
+                  <span>{t('usageKpiCacheUnknown', { count: formatTokens(unknownCacheTokens(hovered)) })}</span>
+                </div>
+              )}
               {hovered.reasoningTokens > 0 && (
                 <div style={{ marginTop: 4, opacity: 0.8 }}>
                   {t('usageKpiReasoning', { count: formatTokens(hovered.reasoningTokens) })}
@@ -348,6 +354,7 @@ function DistributionChart({
                     {' · '}{t('usageKpiOutputShort')} {formatCompactTokens(entry.outputTokens)}
                     {' · '}{t('usageKpiCacheReadShort')} {formatCompactTokens(entry.cacheReadTokens)}
                     {entry.cacheWriteTokens > 0 && ` · ${t('usageKpiCacheWriteShort')} ${formatCompactTokens(entry.cacheWriteTokens)}`}
+                    {unknownCacheTokens(entry) > 0 && ` · ${t('usageKpiCacheUnknown', { count: formatCompactTokens(unknownCacheTokens(entry)) })}`}
                     {entry.reasoningTokens > 0 && ` · ${t('usageKpiReasoning', { count: formatCompactTokens(entry.reasoningTokens) })}`}
                   </div>
                 </div>
@@ -370,6 +377,7 @@ function DistributionChart({
                     {' · '}{t('usageKpiInputShort')} {formatCompactTokens(entry.inputTokens)}
                     {' · '}{t('usageKpiOutputShort')} {formatCompactTokens(entry.outputTokens)}
                     {' · '}{t('usageKpiCacheReadShort')} {formatCompactTokens(entry.cacheReadTokens)}
+                    {unknownCacheTokens(entry) > 0 && ` · ${t('usageKpiCacheUnknown', { count: formatCompactTokens(unknownCacheTokens(entry)) })}`}
                   </div>
                 </div>
               ))}

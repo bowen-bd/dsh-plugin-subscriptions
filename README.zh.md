@@ -2,6 +2,8 @@
 
 [English](README.md) | 中文
 
+> 本仓库是 [V1ki/dsh-plugin-subscriptions](https://github.com/V1ki/dsh-plugin-subscriptions) 的 fork，基于 `v0.9.15`。[`self-hosted-usage` 分支](https://github.com/bowen-bd/dsh-plugin-subscriptions/tree/self-hosted-usage) 提供可选的自托管 DeepSeek 用量、按服务商和账号筛选的热力图，以及仅作用于用量页的服务商可见性。这个分支不是上游的 npm 发行版。
+
 把你的 **ChatGPT(Codex)**、**Claude**、**Grok(X Premium)**、**GitHub Copilot** 和 **Google Antigravity** 订阅当作 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 LLM provider 使用 —— 不需要 API key。Codex、Grok 和 Antigravity 通过 dsh web 界面 OAuth 登录(设置 → 订阅);Copilot 使用 GitHub OAuth 设备码流程;Claude 在存在 Claude Code 会话时直接导入凭据(macOS Keychain 或 `~/.claude/.credentials.json`),否则回退到同样的浏览器 OAuth 流程,因此不要求安装 Claude Code CLI。Token 保存在 `~/.dsh/plugins/subscriptions/auth.json`(权限 0600),过期自动刷新。
 
 ## 订阅与模型显示名
@@ -83,6 +85,24 @@ Antigravity 用量优先读取 `retrieveUserQuotaSummary`，只展示服务端�
 
 插件在本地 `~/.dsh/plugins/subscriptions/usage/`（权限 `0600`）保存汇总计数、周期额度占比和窗口元数据，不在这里保存提示词、凭据或逐请求日志。**清空历史** 支持清空单个服务商或全部服务商在该插件中的本地用量历史，不影响 DSH 会话、账号或实时额度。打开看板不会额外请求额度，也不估算费用。
 
+### 可选的自托管 DeepSeek 用量
+
+热力图随所选服务商和账号切换，始终显示近 26 个 UTC 周，不受趋势图日期范围影响。`usageHiddenProviders` 可将指定服务商从用量筛选、汇总、额度图和清空历史的范围中移除，不影响登录、设置或模型路由。
+
+自托管数据源默认关闭。在 profile 的 `cordis.patch.yml` 中配置本机汇总服务的端口：
+
+```yaml
+- id: llm-subscriptions
+  config:
+    usageHiddenProviders: [grok]  # 可选
+    selfHostedUsage:
+      port: 43210                 # 必填，自行运行的服务端口
+      model: Example DeepSeek     # 可选显示名称
+      accountLabel: Local server  # 可选显示名称
+```
+
+如果已经有 `llm-subscriptions` 配置，请把这些键加到现有条目里；覆盖会替换整个 `config`，请保留其余设置。服务须只监听 `127.0.0.1`，通过 `GET /api/subscriptions-usage` 返回 UTC 按日用量和最近完成扫描的时间戳。请参照[英文版的 JSON 示例](README.md#optional-self-hosted-deepseek-usage)。插件不附带日志扫描器，也不会读取或清空本地模型日志；数据源只应提供聚合计数。
+
 ## Provider 一览
 
 | 路由     | 订阅             | 模型 |
@@ -138,16 +158,16 @@ Claude 请求以 Claude Code 的身份发出，接口会按 Claude Code 版本�
 
 ### 安装命令
 
-本机已有 `dsh` CLI 时,从 npm 安装(预构建产物,无需构建授权):
+如果只需要原版，可以从 npm 安装上游的预构建包（无需构建授权）：
 
 ```sh
 dsh plugin --profile web add dsh-plugin-subscriptions
 ```
 
-也可以从 GitHub 安装源码:
+要安装这个 fork，请使用 GitHub 源码分支。它和上游同名，在同一个 profile 里二选一：
 
 ```sh
-dsh plugin --profile web add github:V1ki/dsh-plugin-subscriptions
+dsh plugin --profile web add github:bowen-bd/dsh-plugin-subscriptions#self-hosted-usage
 ```
 
 首次安装 pnpm 会要求允许该包的构建脚本(git 安装拉取的是源码而非构建产物);把打印出的包名加进 profile 的 `pnpm-workspace.yaml`:
@@ -162,8 +182,8 @@ allowBuilds:
 本地检出安装:
 
 ```sh
-git clone https://github.com/V1ki/dsh-plugin-subscriptions.git
-cd dsh-plugin-subscriptions && pnpm install && pnpm build
+git clone --branch self-hosted-usage https://github.com/bowen-bd/dsh-plugin-subscriptions.git
+(cd dsh-plugin-subscriptions && pnpm install --frozen-lockfile && pnpm build)
 dsh plugin --profile web add ./dsh-plugin-subscriptions
 ```
 
@@ -182,7 +202,7 @@ npm 安装的:
 dsh plugin --profile web update --latest dsh-plugin-subscriptions
 ```
 
-GitHub 安装的:重新执行一遍 `add github:V1ki/dsh-plugin-subscriptions` —— 会重新拉取源码并构建。link 的本地检出只需在检出目录里 `git pull && pnpm build`。
+从 GitHub 安装这个 fork 的：重新执行 `add github:bowen-bd/dsh-plugin-subscriptions#self-hosted-usage`，会重新拉取源码并构建。链接到本地检出的，进入检出目录运行 `git pull && pnpm build`。
 
 无论哪种方式,更新后都要重启 `dsh web` 才会加载新版本。
 
@@ -383,15 +403,9 @@ pnpm 的 package extension 为 Node 组件测试补齐已发布 UI primitives �
 
 改了代码后 `pnpm build` 并重启 `dsh web` 生效。
 
-### 发布
+### Fork 构建
 
-发布由 GitHub Actions（[`release.yml`](.github/workflows/release.yml)）完成，不在维护者本机执行。修改 `package.json` 的 `version` 并提交后，推送同名 tag：
-
-```sh
-git tag v0.9.8 && git push origin main v0.9.8
-```
-
-工作流会校验 tag 与 `package.json` 版本一致，用锁定的 lockfile 安装依赖，执行 `pnpm build` 和 `pnpm test`，通过 [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers) 发布并附带 [provenance 证明](https://docs.npmjs.com/generating-provenance-statements)，最后创建带自动生成说明的 GitHub release。预发布版本（如 `0.10.0-rc.1`）发布到 `next` dist-tag。仓库中不保存任何 npm token：npm 通过 OIDC 对工作流鉴权，npm 包页面上的 provenance 可以将每个发布的 tarball 追溯到构建它的具体 commit 和工作流运行。
+这个分支通过 GitHub 源码分发，不发布到 npm。[Fork CI](.github/workflows/fork-ci.yml) 只构建和测试，不发布软件包。需要固定版本时，可将安装命令里的 `#self-hosted-usage` 替换为完整的 commit SHA。
 
 ## 目录结构
 

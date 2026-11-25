@@ -7,6 +7,7 @@
  * without a cordis boot; `index.ts` only supplies the account list.
  */
 import { USAGE_TRACKED_PROVIDERS, type TrackedProvider } from './constants.js'
+import type { LocalUsageSnapshot } from './local-usage.js'
 import type { AccountUsageQuery, ClearResult, ProviderUsageSnapshot, StoredSummary, UsageService } from './service.js'
 import {
   buildUsageDashboard,
@@ -153,29 +154,35 @@ export function createUsageHistoryController(
   service: UsageServiceFace,
   loggedInAccounts: (provider: TrackedProvider) => Promise<LoggedInAccount[]>,
   now: () => number = Date.now,
+  readLocalUsage?: () => Promise<LocalUsageSnapshot>,
+  hiddenProviders: readonly TrackedProvider[] = [],
 ): UsageHistoryController {
+  const visibleProviders = USAGE_TRACKED_PROVIDERS.filter(provider => !hiddenProviders.includes(provider))
   return {
     async usageDashboard(payload) {
       if (service.snapshot === undefined) {
         throw new Error('usage dashboard requires UsageService.snapshot')
       }
       const snapshotFn = service.snapshot.bind(service)
-      const providerInputs = await Promise.all(USAGE_TRACKED_PROVIDERS.map(async provider => {
-        const [snap, loggedIn] = await Promise.all([
-          snapshotFn(provider),
-          loggedInAccounts(provider),
-        ])
-        return {
-          provider,
-          entries: snap.entries,
-          loggedIn,
-          observed: snap.observed,
-          ...snap.clearedAt === undefined ? {} : { clearedAt: snap.clearedAt },
-          preTracking: snap.total,
-          errors: snap.errors,
-          trackingStartedAt: snap.trackingStartedAt,
-        }
-      }))
+      const [providerInputs, localUsage] = await Promise.all([
+        Promise.all(visibleProviders.map(async provider => {
+          const [snap, loggedIn] = await Promise.all([
+            snapshotFn(provider),
+            loggedInAccounts(provider),
+          ])
+          return {
+            provider,
+            entries: snap.entries,
+            loggedIn,
+            observed: snap.observed,
+            ...snap.clearedAt === undefined ? {} : { clearedAt: snap.clearedAt },
+            preTracking: snap.total,
+            errors: snap.errors,
+            trackingStartedAt: snap.trackingStartedAt,
+          }
+        })),
+        readLocalUsage?.(),
+      ])
       const trackingStartedAt = providerInputs.reduce(
         (min, item) => Math.min(min, item.trackingStartedAt),
         providerInputs[0]?.trackingStartedAt ?? now(),
@@ -184,6 +191,8 @@ export function createUsageHistoryController(
         now: now(),
         trackingStartedAt,
         providers: providerInputs,
+        hiddenProviders,
+        ...(localUsage === undefined ? {} : { localUsage }),
       }, payload)
     },
 
@@ -240,11 +249,15 @@ export function createUsageHistoryController(
     },
 
     async clearUsageHistory(provider) {
-      if (provider !== 'all') return service.clear(provider)
+      if (provider !== 'all') {
+        if (!visibleProviders.includes(provider)) throw new UsageQueryRejected('provider is not in the usage dashboard')
+        return service.clear(provider)
+      }
+      if (visibleProviders.length === 0) throw new UsageQueryRejected('no providers are in the usage dashboard')
       const errors: string[] = []
       let clearedAt: number | undefined
       let firstFailure: unknown
-      for (const tracked of USAGE_TRACKED_PROVIDERS) {
+      for (const tracked of visibleProviders) {
         try {
           const result = await service.clear(tracked)
           clearedAt = clearedAt === undefined ? result.clearedAt : Math.max(clearedAt, result.clearedAt)

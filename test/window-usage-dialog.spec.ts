@@ -497,6 +497,7 @@ test('ClearUsageHistoryDialog renders scope selector and Cancel button cleanly',
   const html = renderToStaticMarkup(createElement(ClearUsageHistoryDialog, {
     target: 'all',
     clearInfo: res.clearInfo,
+    hasLocalUsage: false,
     state: CLEAR_CONFIRM_OPEN,
     t: tEn,
     onTargetChange() {},

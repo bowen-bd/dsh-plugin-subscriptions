@@ -17,6 +17,7 @@ import type { ProviderUsage } from '../providers/common.js'
 import type { ProxyConfigView, ProxyDraft, ProxyInput, ProxyTestResult } from '../http.js'
 import type { CliVersion } from '../providers/npm-cli-version.js'
 import type { TrackedProvider } from '../usage/constants.js'
+import { LOCAL_USAGE_PROVIDER } from '../usage/local-usage.js'
 import {
   DASHBOARD_RANGES,
   UsageQueryRejected,
@@ -395,9 +396,9 @@ function readUsageDashboard(payload: unknown): UsageDashboardPayload {
   if (typeof payload !== 'object' || Array.isArray(payload)) throw new BadRequest('payload must be an object')
   const record = payload as Record<string, unknown>
   const { provider, account, range } = record
-  let parsedProvider: TrackedProvider | 'all' | undefined
+  let parsedProvider: UsageDashboardPayload['provider']
   if (provider !== undefined) {
-    if (provider === 'all') parsedProvider = 'all'
+    if (provider === 'all' || provider === LOCAL_USAGE_PROVIDER) parsedProvider = provider
     else parsedProvider = readUsageProvider({ provider })
   }
   if (account !== undefined && (typeof account !== 'string' || account.length === 0)) {

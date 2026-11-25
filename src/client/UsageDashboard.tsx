@@ -1,8 +1,7 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 import type { ClearResult } from '../usage/service.js'
-import type { TrackedProvider } from '../usage/usage-schema.js'
-import type { DashboardRange, UsageDashboardResponse } from '../usage/usage-dashboard.js'
+import type { DashboardProvider, DashboardRange, UsageDashboardResponse } from '../usage/usage-dashboard.js'
 import { en, type SubscriptionsKey } from './locales.js'
 import { callSubscriptionsAuth } from './subscriptions-rpc.js'
 import { usageDashboardCss } from './usage-dashboard-styles.js'
@@ -12,14 +11,17 @@ import {
   initialUsageDashboardState,
   usageDashboardReducer,
   type ClearConfirmState,
-  type ProviderFilter,
+  type ClearTarget,
   type UsageDashboardAction,
   type UsageDashboardState,
 } from './usage-dashboard-state.js'
 import {
-  TRACKED_PROVIDERS,
+  DASHBOARD_PROVIDERS,
+  LOCAL_PROVIDER,
+  cacheSplitStats,
   formatCompactTokens,
   formatTokens,
+  isLocalProvider,
   providerDisplayName,
   type Translate,
 } from './usage-format.js'
@@ -64,6 +66,10 @@ function formatClockTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
+function formatScanTime(ts: number): string {
+  return new Date(ts).toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+}
+
 export interface UsageDashboardViewProps {
   state: UsageDashboardState
   t: Translate
@@ -76,8 +82,15 @@ export interface UsageDashboardViewProps {
 export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded = false }: UsageDashboardViewProps) {
   const { response, request, phase } = state
   const busy = phase === 'loading'
+  const matchesScope = response?.filters.provider === request.provider && response.filters.account === request.account
+  const scopedResponse = matchesScope ? response : undefined
+  const scopeProviderLabel = request.provider === 'all' ? t('usageHeatmapAllModels') : providerDisplayName(request.provider)
+  const scopeAccount = request.account === 'all' ? undefined : scopedResponse?.providers
+    .filter(p => request.provider === 'all' || p.provider === request.provider)
+    .flatMap(p => p.accounts).find(account => account.key === request.account)
+  const heatmapScopeLabel = scopeAccount === undefined ? scopeProviderLabel : `${scopeProviderLabel} · ${scopeAccount.label ?? scopeAccount.key}`
 
-  const providerTotals = new Map<TrackedProvider, number>()
+  const providerTotals = new Map<DashboardProvider, number>()
   for (const entry of response?.providers ?? []) {
     providerTotals.set(entry.provider, entry.totalTokens)
   }
@@ -86,6 +99,31 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
   const selectedProviderInfo = request.provider === 'all'
     ? undefined
     : response?.providers.find(p => p.provider === request.provider)
+  const localUsage = response?.localUsage
+  const localUnavailable = localUsage?.unavailable === true
+  const localIncomplete = !localUnavailable && localUsage?.incomplete === true
+  const localStale = !localUnavailable && localUsage?.stale === true
+  const localUpdated = localUsage?.updatedAt
+  const localSelected = isLocalProvider(request.provider)
+  // A failed first read has neither totals nor a timestamp: hide the local pill
+  // then, instead of rendering an empty filter. A previous snapshot, any local
+  // totals, or an explicit selection keeps it visible.
+  const localProviderIncluded = localSelected
+    || localUpdated !== undefined
+    || (response?.providers ?? []).some(p => p.provider === LOCAL_PROVIDER.id && p.totalTokens > 0)
+  const visibleProviders = DASHBOARD_PROVIDERS.filter(entry => entry.id === LOCAL_PROVIDER.id
+    ? localProviderIncluded : providerTotals.has(entry.id))
+  const canClear = response !== undefined && Object.keys(response.clearInfo).length > 0 && !localSelected
+  const localInScope = localSelected || (request.provider === 'all' && request.account === 'all')
+  const showLocalNotice = localInScope && (localUnavailable || localIncomplete || localStale)
+
+  const accountText = (provider: DashboardProvider, account: { key: string; label?: string; loggedIn: boolean }): string => (
+    isLocalProvider(provider)
+      ? account.label ?? t('usageLocalAccountFallback')
+      : account.loggedIn
+        ? account.label ?? account.key
+        : t('usageAccountLoggedOut', { account: account.label ?? account.key })
+  )
 
   const accountSelectValue = request.account === 'all'
     ? 'all'
@@ -100,7 +138,7 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
     }
     const sep = raw.indexOf('\u0000')
     if (sep > 0) {
-      const provider = raw.slice(0, sep) as TrackedProvider
+      const provider = raw.slice(0, sep) as DashboardProvider
       const account = raw.slice(sep + 1)
       if (request.provider === 'all') {
         onAction({ type: 'providerAccount', provider, account })
@@ -112,20 +150,48 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
     onAction({ type: 'account', account: raw })
   }
 
-  const summary = response?.summary
-  const hasVisibleUsage = response !== undefined && (
-    response.summary.totalTokens > 0
-    || response.heatmap.some(d => d.totalTokens > 0)
-    || response.quotaCycles.length > 0
-    || response.activeWindows.length > 0
+  const summary = scopedResponse?.summary
+  const hasVisibleUsage = scopedResponse !== undefined && (
+    scopedResponse.summary.totalTokens > 0
+    || scopedResponse.heatmap.some(d => d.totalTokens > 0)
+    || scopedResponse.quotaCycles.length > 0
+    || scopedResponse.activeWindows.length > 0
   )
   const hasAnyGlobalUsage = allProviderTotal > 0
   const isFiltered = request.provider !== 'all' || request.account !== 'all' || request.range !== 'all'
 
   const ioTotal = (summary?.inputTokens ?? 0) + (summary?.outputTokens ?? 0)
   const inputPct = ioTotal > 0 ? ((summary?.inputTokens ?? 0) / ioTotal) * 100 : 50
-  const cacheBase = (summary?.inputTokens ?? 0) + (summary?.cacheReadTokens ?? 0) + (summary?.cacheWriteTokens ?? 0)
-  const cacheHitPct = cacheBase > 0 ? Math.round(((summary?.cacheReadTokens ?? 0) / cacheBase) * 100) : 0
+  // Cache split stats use the contract's prompt denominator
+  // (input + read + write), not input alone: the unknown share can exceed input
+  // because it is a subset of the whole prompt. Unknown tokens stay out of the
+  // denominator and are never counted as misses. When the unknown share may
+  // absorb reported reads, the read contribution is only bounded, so an
+  // over-100% contract rate is rendered as a known-read range instead.
+  const cache = cacheSplitStats({
+    inputTokens: summary?.inputTokens ?? 0,
+    cacheReadTokens: summary?.cacheReadTokens ?? 0,
+    cacheWriteTokens: summary?.cacheWriteTokens ?? 0,
+    cacheUnknownPromptTokens: summary?.cacheUnknownPromptTokens ?? 0,
+  })
+  const cacheHitPct = cache.hitRate === null ? 0 : Math.round(cache.hitRate * 100)
+  const cacheBarPct = Math.min(100, Math.max(0, cacheHitPct))
+  const cachePartial = cache.metering !== 'known'
+  const cacheCoveragePct = Math.round(cache.coverage * 100)
+  // A contract rate above 100% means measured reads outnumber the known prompt,
+  // so part of the read count must sit in the unknown split. Show the share of
+  // reads that are certainly known (a range when the unknown share could hold
+  // some of them) instead of a percentage that cannot be true.
+  const cacheReadsOverAttributed = cache.hitRate !== null && cache.hitRate > 1
+  const cacheKnownReadPct = cacheReadsOverAttributed
+    ? Math.round((cache.knownReadMin / cache.knownPromptTokens) * 100)
+    : cacheHitPct
+  const cacheReadRange = cacheReadsOverAttributed && cache.knownReadMin < cache.knownReadMax
+    ? {
+        min: Math.round((cache.knownReadMin / cache.knownPromptTokens) * 100),
+        max: Math.round((cache.knownReadMax / cache.knownPromptTokens) * 100),
+      }
+    : undefined
 
   return (
     <div className={embedded ? 'dsh-usage-dashboard dsh-usage-dashboard-embedded' : 'dsh-usage-dashboard'}>
@@ -155,11 +221,14 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
               </svg>
               {busy ? t('usageViewLoading') : t('usageRefresh')}
             </button>
+            {localSelected && (
+              <span className="dsh-usage-updated">{t('usageClearLocalOnly')}</span>
+            )}
             <button
               type="button"
               className="dsh-usage-btn dsh-usage-btn-danger"
               aria-haspopup="dialog"
-              disabled={busy || response === undefined}
+              disabled={busy || !canClear}
               onClick={onOpenClear}
             >
               {t('usageClearOpen')}
@@ -182,7 +251,7 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
                 <span className="dsh-usage-pill-badge">{formatCompactTokens(allProviderTotal)}</span>
               )}
             </button>
-            {TRACKED_PROVIDERS.map(entry => {
+            {visibleProviders.map(entry => {
               const total = providerTotals.get(entry.id) ?? 0
               return (
                 <button
@@ -191,6 +260,7 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
                   className="dsh-usage-pill"
                   aria-pressed={request.provider === entry.id}
                   disabled={busy}
+                  title={isLocalProvider(entry.id) ? t('usageLocalProviderHint') : undefined}
                   onClick={() => onAction({ type: 'provider', provider: entry.id })}
                 >
                   <span className="dsh-usage-dot" style={{ background: entry.colorVar }} />
@@ -215,9 +285,7 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
               {selectedProviderInfo !== undefined
                 ? selectedProviderInfo.accounts.map(acct => (
                     <option key={acct.key} value={`${selectedProviderInfo.provider}\u0000${acct.key}`}>
-                      {acct.loggedIn
-                        ? acct.label ?? acct.key
-                        : t('usageAccountLoggedOut', { account: acct.label ?? acct.key })}
+                      {accountText(selectedProviderInfo.provider, acct)}
                     </option>
                   ))
                 : (response?.providers ?? [])
@@ -226,9 +294,7 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
                       <optgroup key={p.provider} label={providerDisplayName(p.provider)}>
                         {p.accounts.map(acct => (
                           <option key={`${p.provider}:${acct.key}`} value={`${p.provider}\u0000${acct.key}`}>
-                            {acct.loggedIn
-                              ? acct.label ?? acct.key
-                              : t('usageAccountLoggedOut', { account: acct.label ?? acct.key })}
+                            {accountText(p.provider, acct)}
                           </option>
                         ))}
                       </optgroup>
@@ -252,6 +318,24 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
           </div>
         </nav>
 
+        {/* Self-hosted coverage notice: never present a partial local scan as complete */}
+        {showLocalNotice && (
+          <div
+            className={`dsh-usage-banner ${localUnavailable && localUpdated === undefined ? 'dsh-usage-banner-error' : 'dsh-usage-banner-warn'}`}
+            role="status"
+          >
+            <span>
+              {localUnavailable
+                ? t(localUpdated === undefined ? 'usageLocalUnavailable' : 'usageLocalStale')
+                : localStale
+                  ? t('usageLocalOutdated')
+                  : t('usageLocalIncomplete')}
+              {localStale && localIncomplete && <> {t('usageLocalIncomplete')}</>}
+              {localUpdated !== undefined && <> {t('usageLocalUpdated', { time: formatScanTime(localUpdated) })}</>}
+            </span>
+          </div>
+        )}
+
         {/* Error & Partial Notices */}
         {phase === 'error' && (
           <div className="dsh-usage-banner dsh-usage-banner-error" role="alert">
@@ -261,9 +345,9 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
             </button>
           </div>
         )}
-        {response !== undefined && response.errors.length > 0 && (
+        {scopedResponse !== undefined && scopedResponse.errors.length > 0 && (
           <div className="dsh-usage-banner dsh-usage-banner-warn" role="status">
-            <span>{t('usageDataErrors', { list: response.errors.join('; ') })}</span>
+            <span>{t('usageDataErrors', { list: scopedResponse.errors.join('; ') })}</span>
           </div>
         )}
         {state.clearErrors.length > 0 && (
@@ -272,15 +356,15 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
           </div>
         )}
 
-        {/* Initial loading state before first response */}
-        {response === undefined && phase === 'loading' && (
+        {/* Don't present the previous provider or account's totals under a new filter. */}
+        {scopedResponse === undefined && busy && (
           <div className="dsh-usage-empty" role="status">
             <p className="dsh-usage-empty-desc">{t('usageViewLoading')}</p>
           </div>
         )}
 
         {/* Empty states */}
-        {response !== undefined && !hasVisibleUsage && (
+        {scopedResponse !== undefined && !hasVisibleUsage && (
           <div className="dsh-usage-empty">
             <h2 className="dsh-usage-empty-title">
               {hasAnyGlobalUsage && isFiltered
@@ -290,7 +374,7 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
             <p className="dsh-usage-empty-desc">
               {hasAnyGlobalUsage && isFiltered
                 ? t('usageDashboardSubtitle')
-                : response.cleared
+                : scopedResponse.cleared
                   ? t('usageEmptyDashboardCleared')
                   : t('usageEmptyDashboardHint')}
             </p>
@@ -308,9 +392,7 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
         )}
 
         {/* Main Dashboard Visualizations */}
-        {response !== undefined && summary !== undefined && hasVisibleUsage && (
-          <>
-            {/* KPI Summary Cards */}
+        {summary !== undefined && hasVisibleUsage && (
             <section className="dsh-usage-kpi-grid" aria-label={t('usageDashboardTitle')}>
               <article className="dsh-usage-kpi-card">
                 <span className="dsh-usage-kpi-label">{t('usageKpiTotal')}</span>
@@ -348,25 +430,40 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
                 <div className="dsh-usage-split-bar" aria-hidden="true">
                   <div
                     style={{
-                      width: `${cacheHitPct}%`,
+                      width: `${cacheBarPct}%`,
                       background: 'var(--dsh-tok-cache-read)',
                     }}
                   />
                   <div
                     style={{
-                      width: `${Math.max(0, 100 - cacheHitPct)}%`,
+                      width: `${Math.max(0, 100 - cacheBarPct)}%`,
                       background: 'var(--dsh-tok-cache-write)',
                       opacity: summary.cacheWriteTokens > 0 ? 0.85 : 0.15,
                     }}
                   />
                 </div>
                 <div className="dsh-usage-kpi-sub">
-                  {cacheBase > 0 ? (
-                    <span>{t('usageKpiCacheHit', { percent: cacheHitPct })}</span>
-                  ) : (
+                  {cache.promptTokens === 0 ? (
                     <span>
                       {t('usageKpiCacheReadShort')} 0 · {t('usageKpiCacheWriteShort')} 0
                     </span>
+                  ) : cache.hitRate === null ? (
+                    <span>{t('usageKpiCacheNoRate')}</span>
+                  ) : (
+                    <span>
+                      {cacheReadRange === undefined
+                        ? t(cachePartial ? 'usageKpiCacheHitKnown' : 'usageKpiCacheHit', { percent: cacheKnownReadPct })
+                        : t('usageKpiCacheHitKnownRange', cacheReadRange)}
+                    </span>
+                  )}
+                  {cachePartial && cache.promptTokens > 0 && (
+                    <span>{t('usageKpiCacheCoverage', { percent: cacheCoveragePct })}</span>
+                  )}
+                  {cacheReadsOverAttributed && (
+                    <span>{t('usageKpiCacheReadUpperBound')}</span>
+                  )}
+                  {cache.unknownPromptTokens > 0 && (
+                    <span>{t('usageKpiCacheUnknown', { count: formatCompactTokens(cache.unknownPromptTokens) })}</span>
                   )}
                 </div>
               </article>
@@ -384,31 +481,40 @@ export function UsageDashboardView({ state, t, onAction, onOpenClear, embedded =
               </article>
             </section>
 
-            {/* Calendar Heatmap */}
-            <UsageHeatmap
-              days={response.heatmap}
-              {...state.selectedDate === undefined ? {} : { selectedDate: state.selectedDate }}
-              onSelectDate={date => onAction(date === undefined ? { type: 'selectDate' } : { type: 'selectDate', date })}
-              t={t}
-            />
+        )}
 
+        {/* Keep the scoped calendar available even for providers without activity. */}
+        {scopedResponse !== undefined && scopedResponse.heatmap.length > 0 && (
+          <UsageHeatmap
+            scopeLabel={heatmapScopeLabel}
+            days={scopedResponse.heatmap}
+            {...state.selectedDate === undefined ? {} : { selectedDate: state.selectedDate }}
+            onSelectDate={date => onAction(date === undefined ? { type: 'selectDate' } : { type: 'selectDate', date })}
+            t={t}
+          />
+        )}
+
+        {scopedResponse !== undefined && hasVisibleUsage && (
+          <>
             {/* Daily Stacked Bar Trend + Model/Provider Distribution */}
             <UsageCharts
-              daily={response.daily}
-              models={response.models}
-              providerBreakdown={response.providerBreakdown}
+              daily={scopedResponse.daily}
+              models={scopedResponse.models}
+              providerBreakdown={scopedResponse.providerBreakdown}
               distributionMode={state.distributionMode}
               onDistributionMode={mode => onAction({ type: 'distribution', mode })}
               onSelectDate={date => onAction({ type: 'selectDate', date })}
               t={t}
             />
 
-            {/* Current & Recent Quota Cycles */}
-            <ActiveWindowsPanel
-              windows={response.quotaCycles.length > 0 ? response.quotaCycles : response.activeWindows}
-              now={response.generatedAt}
-              t={t}
-            />
+            {/* Current & Recent Quota Cycles — cloud-only; self-hosted usage has no quota */}
+            {!localSelected && (
+              <ActiveWindowsPanel
+                windows={scopedResponse.quotaCycles.length > 0 ? scopedResponse.quotaCycles : scopedResponse.activeWindows}
+                now={scopedResponse.generatedAt}
+                t={t}
+              />
+            )}
           </>
         )}
       </div>
@@ -421,7 +527,7 @@ export function UsageDashboard(props: UsageDashboardProps) {
   const { rpc, embedded = false, refreshKey = 0 } = props
   const t = props.t ?? fallbackTranslate
   const [state, dispatch] = useReducer(usageDashboardReducer, undefined, initialUsageDashboardState)
-  const [clearTarget, setClearTarget] = useState<ProviderFilter | undefined>(undefined)
+  const [clearTarget, setClearTarget] = useState<ClearTarget | undefined>(undefined)
   const [clearConfirm, setClearConfirm] = useState<ClearConfirmState | undefined>(undefined)
   const aliveRef = useRef(true)
   const lastRefreshKey = useRef(refreshKey)
@@ -495,7 +601,9 @@ export function UsageDashboard(props: UsageDashboardProps) {
         embedded={embedded}
         onAction={dispatch}
         onOpenClear={() => {
-          setClearTarget(state.request.provider)
+          // Clearing is cloud-only: when the self-hosted route is selected the
+          // button is disabled, but keep this defensive fallback cloud-safe.
+          setClearTarget(isLocalProvider(state.request.provider) ? 'all' : state.request.provider)
           setClearConfirm(CLEAR_CONFIRM_OPEN)
         }}
       />
@@ -503,6 +611,8 @@ export function UsageDashboard(props: UsageDashboardProps) {
         <ClearUsageHistoryDialog
           target={clearTarget}
           clearInfo={state.response.clearInfo}
+          hasLocalUsage={state.response.localUsage !== undefined
+            || state.response.providers.some(p => p.provider === LOCAL_PROVIDER.id)}
           state={clearConfirm}
           t={t}
           onTargetChange={setClearTarget}

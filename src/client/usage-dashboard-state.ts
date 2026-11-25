@@ -1,7 +1,9 @@
 import type { TrackedProvider } from '../usage/usage-schema.js'
-import type { DashboardRange, UsageDashboardResponse } from '../usage/usage-dashboard.js'
+import type { DashboardProvider, DashboardRange, UsageDashboardResponse } from '../usage/usage-dashboard.js'
 
-export type ProviderFilter = TrackedProvider | 'all'
+export type ProviderFilter = DashboardProvider | 'all'
+/** Cloud-only subset: clearing must never target the self-hosted route. */
+export type ClearTarget = TrackedProvider | 'all'
 export type DistributionMode = 'model' | 'provider'
 
 export interface UsageDashboardRequest {
@@ -28,7 +30,7 @@ export type UsageDashboardAction =
   | { type: 'failed'; message: string }
   | { type: 'provider'; provider: ProviderFilter }
   | { type: 'account'; account: string | 'all' }
-  | { type: 'providerAccount'; provider: TrackedProvider; account: string }
+  | { type: 'providerAccount'; provider: DashboardProvider; account: string }
   | { type: 'range'; range: DashboardRange }
   | { type: 'resetFilters' }
   | { type: 'distribution'; mode: DistributionMode }
@@ -48,18 +50,26 @@ export function initialUsageDashboardState(): UsageDashboardState {
 }
 
 function reload(state: UsageDashboardState, request: UsageDashboardRequest): UsageDashboardState {
-  const { error: _error, ...rest } = state
-  return { ...rest, phase: 'loading', request, load: state.load + 1 }
+  const { error: _error, selectedDate, ...rest } = state
+  const sameScope = request.provider === state.request.provider && request.account === state.request.account
+  return {
+    ...rest,
+    ...(sameScope && selectedDate !== undefined ? { selectedDate } : {}),
+    phase: 'loading', request, load: state.load + 1,
+  }
 }
 
 export function usageDashboardReducer(state: UsageDashboardState, action: UsageDashboardAction): UsageDashboardState {
   switch (action.type) {
     case 'loaded': {
       const { error: _error, selectedDate, ...rest } = state
-      const keepDate = selectedDate !== undefined && action.response.heatmap.some(day => day.date === selectedDate)
+      const filters = action.response.filters
+      const sameScope = filters.provider === state.request.provider && filters.account === state.request.account
+      const keepDate = sameScope && selectedDate !== undefined && action.response.heatmap.some(day => day.date === selectedDate)
       return {
         ...rest,
         ...keepDate ? { selectedDate } : {},
+        request: sameScope ? state.request : { ...state.request, ...filters },
         phase: 'shown',
         response: action.response,
       }

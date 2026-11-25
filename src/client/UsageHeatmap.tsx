@@ -1,16 +1,17 @@
 import { useMemo, useState } from 'react'
-import type { TrackedProvider } from '../usage/usage-schema.js'
-import type { DashboardDailyBucket } from '../usage/usage-dashboard.js'
+import type { DashboardDailyBucket, DashboardProvider } from '../usage/usage-dashboard.js'
 import {
   buildHeatmapWeeks,
   formatCompactTokens,
   formatTokens,
   providerAccentColor,
   providerDisplayName,
+  unknownCacheTokens,
   type Translate,
 } from './usage-format.js'
 
 interface Props {
+  scopeLabel: string
   days: readonly DashboardDailyBucket[]
   selectedDate?: string
   onSelectDate: (date?: string) => void
@@ -19,7 +20,7 @@ interface Props {
 
 const WEEKDAY_LABELS: readonly string[] = ['', 'Mon', '', 'Wed', '', 'Fri', '']
 
-export function UsageHeatmap({ days, selectedDate, onSelectDate, t }: Props) {
+export function UsageHeatmap({ scopeLabel, days, selectedDate, onSelectDate, t }: Props) {
   const [hoveredDate, setHoveredDate] = useState<string | undefined>(undefined)
 
   const grid = useMemo(() => buildHeatmapWeeks(days), [days])
@@ -46,6 +47,7 @@ export function UsageHeatmap({ days, selectedDate, onSelectDate, t }: Props) {
 
   const inspectedDate = selectedDate ?? hoveredDate
   const inspected = inspectedDate !== undefined ? byDate.get(inspectedDate) : undefined
+  const inspectedCacheUnknown = inspected === undefined ? 0 : unknownCacheTokens(inspected)
 
   const monthByCol = useMemo(() => {
     const map = new Map<number, string>()
@@ -58,7 +60,7 @@ export function UsageHeatmap({ days, selectedDate, onSelectDate, t }: Props) {
       <div className="dsh-usage-card-header">
         <div>
           <h2 className="dsh-usage-card-title">{t('usageHeatmapTitle')}</h2>
-          <p className="dsh-usage-card-subtitle">{t('usageHeatmapSubtitle')}</p>
+          <p className="dsh-usage-card-subtitle">{t('usageHeatmapSubtitle', { scope: scopeLabel })}</p>
         </div>
         <div className="dsh-usage-heat-legend" aria-hidden="true">
           <span>{t('usageHeatmapLess')}</span>
@@ -177,9 +179,14 @@ export function UsageHeatmap({ days, selectedDate, onSelectDate, t }: Props) {
                       <span>{t('usageKpiReasoning', { count: formatCompactTokens(inspected.reasoningTokens) })}</span>
                     )}
                   </div>
+                  {inspectedCacheUnknown > 0 && (
+                    <p className="dsh-usage-card-subtitle" style={{ margin: 0 }}>
+                      {t('usageKpiCacheUnknown', { count: formatCompactTokens(inspectedCacheUnknown) })}
+                    </p>
+                  )}
                   {Object.keys(inspected.byProvider).length > 0 && (
                     <div className="dsh-usage-window-models">
-                      {(Object.entries(inspected.byProvider) as [TrackedProvider, number][])
+                      {(Object.entries(inspected.byProvider) as [DashboardProvider, number][])
                         .filter(([, value]) => value > 0)
                         .sort((a, b) => b[1] - a[1])
                         .map(([provider, value]) => (

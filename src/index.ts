@@ -92,8 +92,10 @@ import { observeUsageFetchers, type SnapshotObserver, type UsageFetchers } from 
 import { WindowStore } from './usage/window-store.js'
 import type { HostSessionQuery } from './usage/host-events.js'
 import { PreTracking } from './usage/pre-tracking.js'
+import type { TrackedProvider } from './usage/constants.js'
 import { UsageService } from './usage/service.js'
 import { createUsageHistoryController } from './usage/usage-rpc.js'
+import { createLocalUsageReader, type LocalUsageConfig } from './usage/local-usage.js'
 import type { RequestEnd } from './providers/replay.js'
 import {
   CodexAdapter,
@@ -168,6 +170,10 @@ export { withTimeout } from './providers/common.js'
 
 /** Plugin config, validated by the same-named schemastery schema. */
 export interface Config {
+  /** Read a self-hosted DeepSeek aggregate-only usage feed on loopback. */
+  selfHostedUsage?: LocalUsageConfig | null
+  /** Hide selected providers from Usage totals, filters, quotas and clear scope. */
+  usageHiddenProviders?: TrackedProvider[]
   /** Codex /models client_version override; does not change account entitlements. */
   codexClientVersion?: string
   /** Provider routes to register; defaults to every supported provider. */
@@ -243,6 +249,12 @@ const poolMemberSchema: z<PoolMemberRef> = z.object({
 })
 
 export const Config: z<Config> = z.object({
+  selfHostedUsage: z.union([z.object({
+    port: z.number().step(1).min(1).max(65_535).required(),
+    model: z.string(),
+    accountLabel: z.string(),
+  }), z.const(null)]),
+  usageHiddenProviders: z.array(z.union(['codex', 'claude', 'grok', 'antigravity'])).default([]),
   providers: z.array(providerIdSchema).default(['codex', 'claude', 'grok', 'copilot', 'antigravity']),
   codexClientVersion: z.string(),
   streamIdleTimeoutMs: z.number().min(1).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
@@ -1505,6 +1517,9 @@ export function apply(ctx: Context, config: Config): void {
       const label = accountOf(provider, session)
       return label === undefined ? { key } : { key, label }
     }),
+    Date.now,
+    config.selfHostedUsage == null ? undefined : createLocalUsageReader(config.selfHostedUsage),
+    config.usageHiddenProviders,
   ))
 
   // OpenCode-style cadence: a startup check (five-minute cache freshness),

@@ -18,6 +18,10 @@
  *   contribute their own models without loss.
  */
 import { USAGE_TRACKED_PROVIDERS, type TrackedProvider } from './constants.js'
+import {
+  DEFAULT_LOCAL_USAGE_ACCOUNT_LABEL, DEFAULT_LOCAL_USAGE_MODEL, LOCAL_USAGE_ACCOUNT,
+  LOCAL_USAGE_PROVIDER, LOCAL_USAGE_STALE_MS, type LocalUsageSnapshot, type LocalUsageStatus,
+} from './local-usage.js'
 import type { PreTrackingStatus } from './pre-tracking.js'
 import { summarizeStored, type StoredSummary } from './service.js'
 import { combineModels, type DaySums, type ModelSums } from './usage-schema.js'
@@ -27,10 +31,12 @@ import { allWindowsOf, VIEW_KINDS, type ViewKind, type ViewMarker, type ViewWind
 
 export const DASHBOARD_RANGES = ['7d', '30d', '90d', 'all'] as const
 export type DashboardRange = typeof DASHBOARD_RANGES[number]
+export type DashboardProvider = TrackedProvider | typeof LOCAL_USAGE_PROVIDER
+const DASHBOARD_PROVIDERS: readonly DashboardProvider[] = [...USAGE_TRACKED_PROVIDERS, LOCAL_USAGE_PROVIDER]
 
 export interface UsageDashboardPayload {
   /** Provider filter; omitted or 'all' aggregates all tracked providers. */
-  provider?: TrackedProvider | 'all'
+  provider?: DashboardProvider | 'all'
   /** Account filter; omitted or 'all' aggregates all accounts. */
   account?: string | 'all'
   /** Time range for KPI summary, daily trend, models, and providerBreakdown; defaults to '30d'. */
@@ -45,6 +51,8 @@ export interface TokenTotals {
   cacheReadTokens: number
   cacheWriteTokens: number
   reasoningTokens: number
+  /** Subset of the combined prompt buckets whose cache hit/miss split was not reported. */
+  cacheUnknownPromptTokens?: number
 }
 
 export interface DashboardProviderAccount {
@@ -58,7 +66,7 @@ export interface DashboardProviderAccount {
 }
 
 export interface DashboardProviderInfo {
-  provider: TrackedProvider
+  provider: DashboardProvider
   /** Deduplicated total tokens for this provider in the selected range. */
   totalTokens: number
   accounts: DashboardProviderAccount[]
@@ -72,25 +80,25 @@ export interface DashboardSummary extends TokenTotals {
 }
 
 export interface DashboardDailyModelEntry extends TokenTotals {
-  provider: TrackedProvider
+  provider: DashboardProvider
   model: string
 }
 
 export interface DashboardDailyBucket extends TokenTotals {
   /** UTC date 'YYYY-MM-DD'. */
   date: string
-  byProvider: Partial<Record<TrackedProvider, number>>
+  byProvider: Partial<Record<DashboardProvider, number>>
   byModel: DashboardDailyModelEntry[]
 }
 
 export interface DashboardModelSummary extends TokenTotals {
-  provider: TrackedProvider
+  provider: DashboardProvider
   model: string
   share: number
 }
 
 export interface DashboardProviderBreakdown extends TokenTotals {
-  provider: TrackedProvider
+  provider: DashboardProvider
   share: number
   activeModels: number
   activeAccounts: number
@@ -140,7 +148,7 @@ export interface UsageDashboardResponse {
   generatedAt: number
   range: DashboardRange
   filters: {
-    provider: TrackedProvider | 'all'
+    provider: DashboardProvider | 'all'
     account: string | 'all'
   }
   providers: DashboardProviderInfo[]
@@ -152,7 +160,8 @@ export interface UsageDashboardResponse {
   activeWindows: DashboardActiveWindow[]
   /** Current open cycles first, followed by recent closed/ended-early cycles newest-first (capped at 40). */
   quotaCycles: DashboardActiveWindow[]
-  clearInfo: Record<TrackedProvider, DashboardClearInfo>
+  clearInfo: Partial<Record<TrackedProvider, DashboardClearInfo>>
+  localUsage?: LocalUsageStatus
   cleared: boolean
   trackingStartedAt: number
   errors: string[]
@@ -172,6 +181,8 @@ export interface DashboardBuildInput {
   now: number
   trackingStartedAt: number
   providers: readonly ProviderDashboardInput[]
+  hiddenProviders?: readonly TrackedProvider[]
+  localUsage?: LocalUsageSnapshot
 }
 
 /** Calendar heatmap span: 26 full weeks (182 UTC days ending today). */
@@ -204,8 +215,9 @@ function emptyTotals(): TokenTotals {
   }
 }
 
-function countsToTotals(counts: TokenCounts): TokenTotals {
+function countsToTotals(counts: TokenCounts & { cacheUnknownPromptTokens?: number }): TokenTotals {
   const totalTokens = counts.inputTokens + counts.outputTokens + counts.cacheReadTokens + counts.cacheWriteTokens
+  const { cacheUnknownPromptTokens } = counts
   return {
     totalTokens,
     inputTokens: counts.inputTokens,
@@ -213,6 +225,7 @@ function countsToTotals(counts: TokenCounts): TokenTotals {
     cacheReadTokens: counts.cacheReadTokens,
     cacheWriteTokens: counts.cacheWriteTokens,
     reasoningTokens: counts.reasoningTokens,
+    ...(cacheUnknownPromptTokens !== undefined && cacheUnknownPromptTokens > 0 ? { cacheUnknownPromptTokens } : {}),
   }
 }
 
@@ -223,6 +236,9 @@ function addTotals(target: TokenTotals, add: TokenTotals): void {
   target.cacheReadTokens += add.cacheReadTokens
   target.cacheWriteTokens += add.cacheWriteTokens
   target.reasoningTokens += add.reasoningTokens
+  if (add.cacheUnknownPromptTokens !== undefined) {
+    target.cacheUnknownPromptTokens = (target.cacheUnknownPromptTokens ?? 0) + add.cacheUnknownPromptTokens
+  }
 }
 
 function utcDateString(ms: number): string {
@@ -341,14 +357,14 @@ function deduplicateAccountDays(entries: readonly (WindowUsageEntry & { kind: Vi
 
 interface DayAccumulator {
   totals: TokenTotals
-  byProvider: Partial<Record<TrackedProvider, number>>
+  byProvider: Partial<Record<DashboardProvider, number>>
   byModel: Map<string, DashboardDailyModelEntry>
 }
 
 function accumulateDay(
   map: Map<string, DayAccumulator>,
   date: string,
-  provider: TrackedProvider,
+  provider: DashboardProvider,
   model: string,
   totals: TokenTotals,
 ): void {
@@ -394,7 +410,10 @@ export function buildUsageDashboard(
   const now = input.now
   const todayUtc = utcDateString(now)
   const range: DashboardRange = query.range ?? '30d'
-  const filterProvider: TrackedProvider | 'all' = query.provider ?? 'all'
+  const visibleProviders: DashboardProvider[] = USAGE_TRACKED_PROVIDERS.filter(provider => !input.hiddenProviders?.includes(provider))
+  if (input.localUsage !== undefined) visibleProviders.push(LOCAL_USAGE_PROVIDER)
+  const filterProvider = query.provider !== undefined && query.provider !== 'all' && visibleProviders.includes(query.provider)
+    ? query.provider : 'all'
 
   // Index inputs by canonical provider order.
   const inputByProvider = new Map<TrackedProvider, ProviderDashboardInput>(
@@ -403,14 +422,14 @@ export function buildUsageDashboard(
 
   const errors: string[] = []
   const seenErrors = new Set<string>()
-  const clearInfo = {} as Record<TrackedProvider, DashboardClearInfo>
+  const clearInfo: UsageDashboardResponse['clearInfo'] = {}
 
   interface ProcessedAccount {
     key: string
     label?: string
     loggedIn: boolean
     isDefault: boolean
-    days: DaySums
+    days: Record<string, Record<string, TokenCounts & { cacheUnknownPromptTokens?: number }>>
     lifetimeTokens: number
   }
 
@@ -423,9 +442,10 @@ export function buildUsageDashboard(
     observed: (account: string) => readonly ObservedWindow[]
   }
 
-  const processedProviders: ProcessedProvider[] = []
+  const subscriptionProviders: ProcessedProvider[] = []
 
   for (const provider of USAGE_TRACKED_PROVIDERS) {
+    if (!visibleProviders.includes(provider)) continue
     const item = inputByProvider.get(provider)
     const rawEntries = item?.entries ?? []
     const clearedAt = item?.clearedAt
@@ -478,13 +498,30 @@ export function buildUsageDashboard(
       return { ...acct, days, lifetimeTokens }
     })
 
-    processedProviders.push({
+    subscriptionProviders.push({
       provider,
       visibleEntries,
       accounts,
       ...clearedAt === undefined ? {} : { clearedAt },
       preTracking,
       observed,
+    })
+  }
+
+  const processedProviders: ({ provider: DashboardProvider; accounts: ProcessedAccount[]; clearedAt?: number })[] =
+    [...subscriptionProviders]
+  if (input.localUsage !== undefined) {
+    const { model = DEFAULT_LOCAL_USAGE_MODEL, accountLabel = DEFAULT_LOCAL_USAGE_ACCOUNT_LABEL } = input.localUsage
+    const days: ProcessedAccount['days'] = {}
+    let lifetimeTokens = 0
+    for (const { date, ...counts } of input.localUsage.days) {
+      if (date > todayUtc) continue
+      days[date] = { [model]: counts }
+      lifetimeTokens += countsToTotals(counts).totalTokens
+    }
+    processedProviders.push({
+      provider: LOCAL_USAGE_PROVIDER,
+      accounts: [{ key: LOCAL_USAGE_ACCOUNT, label: accountLabel, loggedIn: false, isDefault: true, days, lifetimeTokens }],
     })
   }
 
@@ -504,7 +541,7 @@ export function buildUsageDashboard(
   const heatmapStartDate = addUtcDays(todayUtc, -(HEATMAP_DAYS - 1))
 
   // Compute per-provider totals for the selected range (for provider tabs/pills).
-  const providerRangeTotals = new Map<TrackedProvider, number>()
+  const providerRangeTotals = new Map<DashboardProvider, number>()
   for (const p of processedProviders) {
     let total = 0
     for (const acct of p.accounts) {
@@ -526,8 +563,8 @@ export function buildUsageDashboard(
   const activeDaysSet = new Set<string>()
   const activeAccountsSet = new Set<string>()
 
-  const modelTotalsMap = new Map<string, { provider: TrackedProvider; model: string; totals: TokenTotals }>()
-  const providerBreakdownMap = new Map<TrackedProvider, {
+  const modelTotalsMap = new Map<string, { provider: DashboardProvider; model: string; totals: TokenTotals }>()
+  const providerBreakdownMap = new Map<DashboardProvider, {
     totals: TokenTotals
     models: Set<string>
     accounts: Set<string>
@@ -624,7 +661,7 @@ export function buildUsageDashboard(
       activeModels: item.models.size,
       activeAccounts: item.accounts.size,
     }))
-    .sort((a, b) => b.totalTokens - a.totalTokens || USAGE_TRACKED_PROVIDERS.indexOf(a.provider) - USAGE_TRACKED_PROVIDERS.indexOf(b.provider))
+    .sort((a, b) => b.totalTokens - a.totalTokens || DASHBOARD_PROVIDERS.indexOf(a.provider) - DASHBOARD_PROVIDERS.indexOf(b.provider))
 
   // Build current + recent historical quota cycle cards for matched accounts.
   const activeWindows: DashboardActiveWindow[] = []
@@ -672,7 +709,9 @@ export function buildUsageDashboard(
     }
   }
 
-  for (const p of matchedProviders) {
+  for (const p of subscriptionProviders) {
+    if (filterProvider !== 'all' && filterProvider !== p.provider) continue
+    if (filterAccount === LOCAL_USAGE_ACCOUNT) continue
     for (const acct of p.accounts) {
       if (filterAccount !== 'all' && acct.key !== filterAccount) continue
       const windows = allWindowsOf({
@@ -741,11 +780,24 @@ export function buildUsageDashboard(
     ...p.clearedAt === undefined ? {} : { clearedAt: p.clearedAt },
   }))
 
+  const localUpdatedAt = input.localUsage?.updatedAt
+  const localUsage: LocalUsageStatus | undefined = input.localUsage === undefined ? undefined : {
+    ...(localUpdatedAt === undefined ? {} : { updatedAt: localUpdatedAt }),
+    ...(input.localUsage.incomplete === true ? { incomplete: true } : {}),
+    ...(input.localUsage.unavailable === true ? { unavailable: true } : {}),
+    ...(localUpdatedAt !== undefined && now - localUpdatedAt >= LOCAL_USAGE_STALE_MS ? { stale: true } : {}),
+  }
+  const scopedCloud = matchedProviders.filter(p => p.provider !== LOCAL_USAGE_PROVIDER)
+  const localApplies = filterProvider === LOCAL_USAGE_PROVIDER
+    || (filterProvider === 'all' && (filterAccount === 'all' || filterAccount === LOCAL_USAGE_ACCOUNT))
+  const localHasWarning = localApplies && (localUsage?.unavailable || localUsage?.incomplete || localUsage?.stale)
   const cleared = summary.totalTokens === 0
     && activeWindows.length === 0
     && quotaCycles.length === 0
-    && matchedProviders.length > 0
-    && matchedProviders.every(p => p.clearedAt !== undefined)
+    && filterAccount !== LOCAL_USAGE_ACCOUNT
+    && !localHasWarning
+    && scopedCloud.length > 0
+    && scopedCloud.every(p => p.clearedAt !== undefined)
 
   return {
     generatedAt: now,
@@ -763,6 +815,7 @@ export function buildUsageDashboard(
     activeWindows,
     quotaCycles,
     clearInfo,
+    ...(localUsage === undefined ? {} : { localUsage }),
     cleared,
     trackingStartedAt: input.trackingStartedAt,
     errors,

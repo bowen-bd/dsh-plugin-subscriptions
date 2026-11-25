@@ -1,5 +1,5 @@
 import type { TrackedProvider } from '../usage/usage-schema.js'
-import type { DashboardDailyBucket } from '../usage/usage-dashboard.js'
+import type { DashboardDailyBucket, DashboardProvider } from '../usage/usage-dashboard.js'
 import type { KindOption, ViewMarker } from '../usage/window-view.js'
 import type { SubscriptionsKey } from './locales.js'
 
@@ -13,12 +13,106 @@ export const TRACKED_PROVIDERS: readonly { id: TrackedProvider; name: string; co
   { id: 'antigravity', name: 'Antigravity', colorVar: 'var(--dsh-provider-antigravity, #3b82f6)' },
 ]
 
-export function providerDisplayName(provider: TrackedProvider): string {
-  return TRACKED_PROVIDERS.find(entry => entry.id === provider)?.name ?? provider
+/**
+ * Display metadata for the self-hosted DeepSeek route. Cyan is deliberately
+ * distinct from every subscription provider accent.
+ */
+export const LOCAL_PROVIDER = {
+  id: 'deepseek-local',
+  name: 'Self-hosted DeepSeek',
+  colorVar: 'var(--dsh-provider-deepseek-local, #22d3ee)',
+} as const satisfies { id: DashboardProvider; name: string; colorVar: string }
+
+/** Provider filters offered by the dashboard: subscription providers first, local last. */
+export const DASHBOARD_PROVIDERS: readonly { id: DashboardProvider; name: string; colorVar: string }[] = [
+  ...TRACKED_PROVIDERS,
+  LOCAL_PROVIDER,
+]
+
+/** Whether a dashboard provider id is the self-hosted DeepSeek route. */
+export function isLocalProvider(provider: DashboardProvider | 'all'): provider is 'deepseek-local' {
+  return provider === LOCAL_PROVIDER.id
 }
 
-export function providerAccentColor(provider: TrackedProvider): string {
-  return TRACKED_PROVIDERS.find(entry => entry.id === provider)?.colorVar ?? 'var(--dsw-alias-state-business-primary, #3b82f6)'
+export function providerDisplayName(provider: DashboardProvider): string {
+  return DASHBOARD_PROVIDERS.find(entry => entry.id === provider)?.name ?? provider
+}
+
+export function providerAccentColor(provider: DashboardProvider): string {
+  return DASHBOARD_PROVIDERS.find(entry => entry.id === provider)?.colorVar ?? 'var(--dsw-alias-state-business-primary, #3b82f6)'
+}
+
+/**
+ * Prompt tokens whose cache hit/miss split was not reported. They are a subset
+ * of the combined prompt total (`inputTokens + cacheReadTokens + cacheWriteTokens`)
+ * and must never be presented as cache misses.
+ */
+export function unknownCacheTokens(totals: { cacheUnknownPromptTokens?: number }): number {
+  return nonNegativeTokenCount(totals.cacheUnknownPromptTokens)
+}
+
+function nonNegativeTokenCount(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+/** Whether the prompt total has a fully, partly, or not-at-all measured cache split. */
+export type CacheMetering = 'known' | 'partial' | 'unknown'
+
+export interface CacheSplitStats {
+  /** inputTokens + cacheReadTokens + cacheWriteTokens. */
+  promptTokens: number
+  /** Subset of promptTokens whose cache hit/miss split was not reported. */
+  unknownPromptTokens: number
+  /** promptTokens - unknownPromptTokens; the only valid denominator for a cache rate. */
+  knownPromptTokens: number
+  /** knownPromptTokens / promptTokens (1 for an empty prompt). */
+  coverage: number
+  metering: CacheMetering
+  /**
+   * `cacheReadTokens / knownPromptTokens`. Null when prompt tokens exist but
+   * none has a measured split; an empty prompt is 0 by contract, not null.
+   */
+  hitRate: number | null
+  /**
+   * The unknown share may itself contain reported cache reads, so the read
+   * contribution to the known prompt is only bounded: `knownReadMin` assumes
+   * every unknown token is a read, `knownReadMax` counts every reported read.
+   */
+  knownReadMin: number
+  knownReadMax: number
+}
+
+/**
+ * Cache split statistics over the contract's prompt denominator. Legacy
+ * `cacheUnknownPromptTokens` is a subset of the whole prompt, not of input
+ * alone, so subtracting it from input understates the denominator whenever
+ * the unknown share exceeds the input bucket.
+ */
+export function cacheSplitStats(totals: {
+  inputTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  cacheUnknownPromptTokens?: number
+}): CacheSplitStats {
+  const input = nonNegativeTokenCount(totals.inputTokens)
+  const read = nonNegativeTokenCount(totals.cacheReadTokens)
+  const write = nonNegativeTokenCount(totals.cacheWriteTokens)
+  const promptTokens = input + read + write
+  const unknownPromptTokens = Math.min(nonNegativeTokenCount(totals.cacheUnknownPromptTokens), promptTokens)
+  const knownPromptTokens = promptTokens - unknownPromptTokens
+  const metering: CacheMetering = promptTokens === 0 || unknownPromptTokens === 0
+    ? 'known'
+    : knownPromptTokens > 0 ? 'partial' : 'unknown'
+  return {
+    promptTokens,
+    unknownPromptTokens,
+    knownPromptTokens,
+    coverage: promptTokens === 0 ? 1 : knownPromptTokens / promptTokens,
+    metering,
+    hitRate: knownPromptTokens > 0 ? read / knownPromptTokens : promptTokens === 0 ? 0 : null,
+    knownReadMin: Math.max(0, read - unknownPromptTokens),
+    knownReadMax: Math.min(read, knownPromptTokens),
+  }
 }
 
 /** Locale keys for usage-window markers. */
