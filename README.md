@@ -192,14 +192,14 @@ To try the fork, install its source branch from GitHub instead. It uses the same
 dsh plugin --profile web add github:bowen-bd/dsh-plugin-subscriptions#self-hosted-usage
 ```
 
-pnpm will ask you to allow this package's build script on first install (git installs fetch sources, not built artifacts); add the printed key to the profile's `pnpm-workspace.yaml`:
+A GitHub install runs the source package's `prepare` script. If pnpm blocks it, add the **exact key** printed in the error under `allowBuilds` in the profile's `pnpm-workspace.yaml`, even if the error labels it `onlyBuiltDependencies`. For example (replace `<commit-sha>` with the SHA from the error):
 
 ```yaml
 allowBuilds:
-  dsh-plugin-subscriptions: true
+  'dsh-plugin-subscriptions@https://codeload.github.com/bowen-bd/dsh-plugin-subscriptions/tar.gz/<commit-sha>': true
 ```
 
-and re-run the `add`. Only grant this to packages you trust — it runs the package's code at install time.
+Then re-run `add`. Review the source before approving; the approved commit runs code at install time. Pinning the install command to that SHA keeps subsequent installs on the same reviewed revision.
 
 From a local checkout instead:
 

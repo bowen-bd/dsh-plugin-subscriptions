@@ -170,14 +170,14 @@ dsh plugin --profile web add dsh-plugin-subscriptions
 dsh plugin --profile web add github:bowen-bd/dsh-plugin-subscriptions#self-hosted-usage
 ```
 
-首次安装 pnpm 会要求允许该包的构建脚本(git 安装拉取的是源码而非构建产物);把打印出的包名加进 profile 的 `pnpm-workspace.yaml`:
+从 GitHub 安装会运行源码包的 `prepare` 脚本。如果 pnpm 阻止构建，请把报错中打印的**完整键**加到 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds` 下，即使报错里写的是 `onlyBuiltDependencies`。例如（将 `<commit-sha>` 替换为报错中的 SHA）：
 
 ```yaml
 allowBuilds:
-  dsh-plugin-subscriptions: true
+  'dsh-plugin-subscriptions@https://codeload.github.com/bowen-bd/dsh-plugin-subscriptions/tar.gz/<commit-sha>': true
 ```
 
-然后重新执行 `add`。该授权会在安装时执行包的代码,只授给你信任的来源。
+然后重新执行 `add`。授权会在安装时执行该提交的代码，请先检查源码；也可将安装命令固定到同一 SHA，避免下次安装切换到新提交。
 
 本地检出安装:
 
